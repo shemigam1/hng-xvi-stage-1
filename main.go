@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
@@ -436,6 +437,11 @@ func initDB() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	// Load .env if present (silently ignored in production where env vars are set directly).
+	if err := godotenv.Load(); err != nil {
+		log.Println(".env not found, using environment variables")
+	}
+
 	initDB()
 
 	mux := http.NewServeMux()

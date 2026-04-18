@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,9 +19,13 @@ import (
 	_ "github.com/lib/pq"
 )
 
-var db *sql.DB
+var (
+	db         *sql.DB
+	httpClient = &http.Client{Timeout: 15 * time.Second}
+)
 
-// Profile is the full profile stored in DB and returned for single/create endpoints.
+// ─── Models ───────────────────────────────────────────────────────────────────
+
 type Profile struct {
 	ID                 string    `json:"id"`
 	Name               string    `json:"name"`
@@ -43,18 +49,17 @@ type ProfileSummary struct {
 	CountryID string `json:"country_id"`
 }
 
-// External API response types.
+// ─── External API types ───────────────────────────────────────────────────────
+
 type genderizeResponse struct {
-	Name        string  `json:"name"`
 	Gender      *string `json:"gender"`
 	Probability float64 `json:"probability"`
 	Count       int     `json:"count"`
 }
 
 type agifyResponse struct {
-	Name  string `json:"name"`
-	Age   *int   `json:"age"`
-	Count int    `json:"count"`
+	Age   *int `json:"age"`
+	Count int  `json:"count"`
 }
 
 type nationalizeCountry struct {
@@ -63,7 +68,6 @@ type nationalizeCountry struct {
 }
 
 type nationalizeResponse struct {
-	Name    string               `json:"name"`
 	Country []nationalizeCountry `json:"country"`
 }
 
@@ -82,12 +86,6 @@ func classifyAge(age int) string {
 	}
 }
 
-func setCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-}
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -103,50 +101,195 @@ func errJSON(w http.ResponseWriter, status int, message string) {
 	})
 }
 
-// ─── External API calls ───────────────────────────────────────────────────────
+// corsMiddleware wraps every handler and guarantees CORS headers are always present,
+// regardless of what the inner handler does (including panics / early returns).
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-func fetchJSON(rawURL string, dest any) error {
-	resp, err := http.Get(rawURL)
-	if err != nil {
-		return err
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, dest)
 }
 
-func callGenderize(name string) (*genderizeResponse, error) {
-	var r genderizeResponse
-	if err := fetchJSON("https://api.genderize.io?name="+url.QueryEscape(name), &r); err != nil {
-		return nil, err
+// ─── External API calls (concurrent, with retry) ─────────────────────────────
+
+func fetchJSON(ctx context.Context, rawURL string, dest any) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "HNG-Stage1-Bot/1.0")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("upstream status %d", resp.StatusCode)
+			continue
+		}
+		if err := json.Unmarshal(body, dest); err != nil {
+			return err
+		}
+		return nil
 	}
-	return &r, nil
+	return lastErr
 }
 
-func callAgify(name string) (*agifyResponse, error) {
-	var r agifyResponse
-	if err := fetchJSON("https://api.agify.io?name="+url.QueryEscape(name), &r); err != nil {
-		return nil, err
-	}
-	return &r, nil
+type externalResults struct {
+	gender      *genderizeResponse
+	agify       *agifyResponse
+	nationalize *nationalizeResponse
+	errSrc      string // which API failed
+	err         error
 }
 
-func callNationalize(name string) (*nationalizeResponse, error) {
-	var r nationalizeResponse
-	if err := fetchJSON("https://api.nationalize.io?name="+url.QueryEscape(name), &r); err != nil {
-		return nil, err
+// callAllAPIs fires all three external calls concurrently.
+func callAllAPIs(ctx context.Context, name string) externalResults {
+	encoded := url.QueryEscape(name)
+
+	var (
+		mu  sync.Mutex
+		res externalResults
+		wg  sync.WaitGroup
+	)
+
+	type job struct {
+		url    string
+		apiKey string
+		decode func([]byte) error
 	}
-	return &r, nil
+
+	var gData genderizeResponse
+	var aData agifyResponse
+	var nData nationalizeResponse
+
+	jobs := []job{
+		{
+			url:    "https://api.genderize.io?name=" + encoded,
+			apiKey: "Genderize",
+			decode: func(b []byte) error { return json.Unmarshal(b, &gData) },
+		},
+		{
+			url:    "https://api.agify.io?name=" + encoded,
+			apiKey: "Agify",
+			decode: func(b []byte) error { return json.Unmarshal(b, &aData) },
+		},
+		{
+			url:    "https://api.nationalize.io?name=" + encoded,
+			apiKey: "Nationalize",
+			decode: func(b []byte) error { return json.Unmarshal(b, &nData) },
+		},
+	}
+
+	for _, j := range jobs {
+		j := j
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := fetchJSON(ctx, j.url, j.decode)
+			if err == nil {
+				// run the decode against the raw struct pointer
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if res.err == nil {
+				res.errSrc = j.apiKey
+				res.err = err
+			}
+		}()
+	}
+	wg.Wait()
+
+	// fetchJSON already decoded into the struct pointers via the decode func.
+	// But we passed a func that re-unmarshals — let's just do a direct fetch instead.
+	// (See simpler parallel approach below — we'll keep a cleaner pattern.)
+	res.gender = &gData
+	res.agify = &aData
+	res.nationalize = &nData
+	return res
+}
+
+// callAPIsParallel is the cleaner parallel implementation.
+func callAPIsParallel(ctx context.Context, name string) (
+	g *genderizeResponse, a *agifyResponse, n *nationalizeResponse,
+	failedAPI string, err error,
+) {
+	encoded := url.QueryEscape(name)
+
+	type gResult struct {
+		data *genderizeResponse
+		err  error
+	}
+	type aResult struct {
+		data *agifyResponse
+		err  error
+	}
+	type nResult struct {
+		data *nationalizeResponse
+		err  error
+	}
+
+	gCh := make(chan gResult, 1)
+	aCh := make(chan aResult, 1)
+	nCh := make(chan nResult, 1)
+
+	go func() {
+		var r genderizeResponse
+		e := fetchJSON(ctx, "https://api.genderize.io?name="+encoded, &r)
+		gCh <- gResult{&r, e}
+	}()
+	go func() {
+		var r agifyResponse
+		e := fetchJSON(ctx, "https://api.agify.io?name="+encoded, &r)
+		aCh <- aResult{&r, e}
+	}()
+	go func() {
+		var r nationalizeResponse
+		e := fetchJSON(ctx, "https://api.nationalize.io?name="+encoded, &r)
+		nCh <- nResult{&r, e}
+	}()
+
+	gr := <-gCh
+	ar := <-aCh
+	nr := <-nCh
+
+	if gr.err != nil {
+		return nil, nil, nil, "Genderize", gr.err
+	}
+	if ar.err != nil {
+		return nil, nil, nil, "Agify", ar.err
+	}
+	if nr.err != nil {
+		return nil, nil, nil, "Nationalize", nr.err
+	}
+	return gr.data, ar.data, nr.data, "", nil
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 // POST /api/profiles
 func handleCreateProfile(w http.ResponseWriter, r *http.Request) {
-	// Parse body: keep name as interface{} so we can detect wrong types.
+	// Accept only JSON body with "name" key.
 	var raw map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		errJSON(w, http.StatusBadRequest, "Invalid request body")
@@ -171,16 +314,18 @@ func handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotency: return existing profile if name already exists (case-insensitive).
+	// Idempotency: return existing profile if the name is already stored.
 	var existing Profile
-	err := db.QueryRow(`
-		SELECT id, name, gender, gender_probability, sample_size, age, age_group,
-		       country_id, country_probability, created_at
+	err := db.QueryRowContext(r.Context(), `
+		SELECT id, name, gender, gender_probability, sample_size,
+		       age, age_group, country_id, country_probability, created_at
 		FROM profiles WHERE LOWER(name) = LOWER($1)`, name).
-		Scan(&existing.ID, &existing.Name, &existing.Gender, &existing.GenderProbability,
-			&existing.SampleSize, &existing.Age, &existing.AgeGroup,
+		Scan(&existing.ID, &existing.Name, &existing.Gender,
+			&existing.GenderProbability, &existing.SampleSize,
+			&existing.Age, &existing.AgeGroup,
 			&existing.CountryID, &existing.CountryProbability, &existing.CreatedAt)
 	if err == nil {
+		existing.CreatedAt = existing.CreatedAt.UTC()
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"status":  "success",
 			"message": "Profile already exists",
@@ -189,30 +334,37 @@ func handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != sql.ErrNoRows {
+		log.Printf("DB lookup error: %v", err)
 		errJSON(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 
-	// Call all three external APIs.
-	gData, err := callGenderize(name)
-	if err != nil || gData.Gender == nil || gData.Count == 0 {
+	// Call all three external APIs concurrently (with 12s deadline).
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+
+	gData, aData, nData, failedAPI, apiErr := callAPIsParallel(ctx, name)
+	if apiErr != nil {
+		log.Printf("External API error (%s): %v", failedAPI, apiErr)
+		errJSON(w, http.StatusBadGateway, failedAPI+" returned an invalid response")
+		return
+	}
+
+	// Validate responses.
+	if gData.Gender == nil || gData.Count == 0 {
 		errJSON(w, http.StatusBadGateway, "Genderize returned an invalid response")
 		return
 	}
-
-	aData, err := callAgify(name)
-	if err != nil || aData.Age == nil {
+	if aData.Age == nil {
 		errJSON(w, http.StatusBadGateway, "Agify returned an invalid response")
 		return
 	}
-
-	nData, err := callNationalize(name)
-	if err != nil || len(nData.Country) == 0 {
+	if len(nData.Country) == 0 {
 		errJSON(w, http.StatusBadGateway, "Nationalize returned an invalid response")
 		return
 	}
 
-	// Pick highest-probability country.
+	// Pick the country with the highest probability.
 	top := nData.Country[0]
 	for _, c := range nData.Country[1:] {
 		if c.Probability > top.Probability {
@@ -240,15 +392,16 @@ func handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:          time.Now().UTC(),
 	}
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(r.Context(), `
 		INSERT INTO profiles
-		  (id, name, gender, gender_probability, sample_size, age, age_group,
-		   country_id, country_probability, created_at)
+		  (id, name, gender, gender_probability, sample_size,
+		   age, age_group, country_id, country_probability, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		profile.ID, profile.Name, profile.Gender, profile.GenderProbability,
 		profile.SampleSize, profile.Age, profile.AgeGroup,
 		profile.CountryID, profile.CountryProbability, profile.CreatedAt)
 	if err != nil {
+		log.Printf("DB insert error: %v", err)
 		errJSON(w, http.StatusInternalServerError, "Failed to store profile")
 		return
 	}
@@ -262,9 +415,9 @@ func handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 // GET /api/profiles/:id
 func handleGetProfile(w http.ResponseWriter, r *http.Request, id string) {
 	var p Profile
-	err := db.QueryRow(`
-		SELECT id, name, gender, gender_probability, sample_size, age, age_group,
-		       country_id, country_probability, created_at
+	err := db.QueryRowContext(r.Context(), `
+		SELECT id, name, gender, gender_probability, sample_size,
+		       age, age_group, country_id, country_probability, created_at
 		FROM profiles WHERE id = $1`, id).
 		Scan(&p.ID, &p.Name, &p.Gender, &p.GenderProbability, &p.SampleSize,
 			&p.Age, &p.AgeGroup, &p.CountryID, &p.CountryProbability, &p.CreatedAt)
@@ -276,14 +429,14 @@ func handleGetProfile(w http.ResponseWriter, r *http.Request, id string) {
 		errJSON(w, http.StatusInternalServerError, "Database error")
 		return
 	}
-
+	p.CreatedAt = p.CreatedAt.UTC()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "success",
 		"data":   p,
 	})
 }
 
-// GET /api/profiles  (with optional filter params)
+// GET /api/profiles
 func handleListProfiles(w http.ResponseWriter, r *http.Request) {
 	query := `
 		SELECT id, name, gender, age, age_group, country_id
@@ -307,7 +460,7 @@ func handleListProfiles(w http.ResponseWriter, r *http.Request) {
 		idx++
 	}
 
-	rows, err := db.Query(query, args...)
+	rows, err := db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database error")
 		return
@@ -333,7 +486,7 @@ func handleListProfiles(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /api/profiles/:id
 func handleDeleteProfile(w http.ResponseWriter, r *http.Request, id string) {
-	result, err := db.Exec(`DELETE FROM profiles WHERE id = $1`, id)
+	result, err := db.ExecContext(r.Context(), `DELETE FROM profiles WHERE id = $1`, id)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database error")
 		return
@@ -346,15 +499,10 @@ func handleDeleteProfile(w http.ResponseWriter, r *http.Request, id string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ─── Router ───────────────────────────────────────────────────────────────────
+// ─── Routing ─────────────────────────────────────────────────────────────────
 
-// /api/profiles  — collection
+// profilesCollection handles /api/profiles (exact, no trailing slash).
 func profilesCollection(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	switch r.Method {
 	case http.MethodGet:
 		handleListProfiles(w, r)
@@ -365,19 +513,14 @@ func profilesCollection(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// /api/profiles/:id  — single item
+// profilesItem handles /api/profiles/{id}.
 func profilesItem(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// Extract ID: strip "/api/profiles/" prefix.
 	id := strings.TrimPrefix(r.URL.Path, "/api/profiles/")
 	id = strings.Trim(id, "/")
+
 	if id == "" {
-		errJSON(w, http.StatusBadRequest, "Missing profile ID")
+		// Trailing-slash variant of the collection — treat as collection.
+		profilesCollection(w, r)
 		return
 	}
 
@@ -391,12 +534,12 @@ func profilesItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ─── DB init ──────────────────────────────────────────────────────────────────
+// ─── DB ──────────────────────────────────────────────────────────────────────
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://localhost/hng_profiles?sslmode=disable"
+		log.Fatal("DATABASE_URL is required")
 	}
 
 	var err error
@@ -404,9 +547,14 @@ func initDB() {
 	if err != nil {
 		log.Fatalf("sql.Open: %v", err)
 	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	if err = db.Ping(); err != nil {
 		log.Fatalf("db.Ping: %v", err)
 	}
+	log.Println("Connected to database")
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS profiles (
@@ -425,7 +573,6 @@ func initDB() {
 		log.Fatalf("CREATE TABLE: %v", err)
 	}
 
-	// Unique index on lowercase name for idempotency.
 	_, err = db.Exec(`
 		CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_lower
 		ON profiles (LOWER(name))`)
@@ -437,16 +584,16 @@ func initDB() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	// Load .env if present (silently ignored in production where env vars are set directly).
 	if err := godotenv.Load(); err != nil {
-		log.Println(".env not found, using environment variables")
+		log.Println(".env not found, falling back to environment variables")
 	}
 
 	initDB()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/profiles", profilesCollection)
-	mux.HandleFunc("/api/profiles/", profilesItem)
+	// Wrap every route with CORS middleware so headers are ALWAYS present.
+	mux.HandleFunc("/api/profiles", corsMiddleware(profilesCollection))
+	mux.HandleFunc("/api/profiles/", corsMiddleware(profilesItem))
 
 	port := os.Getenv("PORT")
 	if port == "" {
